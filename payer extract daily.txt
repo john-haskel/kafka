@@ -1,0 +1,1056 @@
+from pyspark.sql.functions import *
+from awsglue.transforms import *
+from awsglue.utils import getResolvedOptions
+import pyspark.sql.functions as F
+from pyspark.sql.window import Window
+from pyspark.sql.types import StringType, IntegerType
+from py4j.protocol import Py4JJavaError
+import time
+import sys
+import boto3
+import json
+import ast
+from process_config import *
+import process_config
+import libraries.aws_sessions as aws
+import libraries.spark_session as sc
+from libraries.audit_utils import AuditUtils
+from libraries.spark_utils import ListParam
+from libraries.alarm_utils import CWAlarmWrapper
+from kafkautils.kafkautils import KafkaProducer
+from rds_utils.pg_db import Postgres
+from rds_utils.mssql_db import SqlServerUtils
+from libraries.exception_utils import exception_handler
+from webex_wrapper.webex_wrapper import WebExWrapper
+from pyspark.storagelevel import StorageLevel
+from functools import reduce
+from pyspark.sql import SparkSession
+import datetime
+from pytz import timezone
+from pyspark import StorageLevel
+from sqlalchemy import text, create_engine
+import pandas as pd
+from urllib.parse import quote_plus
+
+
+def get_secrets(secret_id):
+    """
+    This method gathers DB credentials from AWS secrete mgr using id
+    :param secret_id: secreteID
+    :return:  DB credentials
+    """
+    try:
+        sc.logger.info("Fetching the secret ID from AWS SecretManager....")
+        client = boto3.client("secretsmanager")
+        get_secret_value_response = client.get_secret_value(SecretId=secret_id)
+        return json.loads(get_secret_value_response["SecretString"])
+    except Exception as e:
+        sc.logger.error("Error from secrets manager call : {0}".format(e))
+        raise e
+
+
+def setArgs(envType):
+    global P_ENV, P_RDS_SECRET, P_PCRS_SECRET, P_KAFKA_SECRET, P_JOB_RUN_ID, P_JOB_RUN_ID, P_JOB_NM, P_RUN_TYPE, P_SOURCE_TBL, P_TARGET_TBL, P_CONTROL_ID, P_PROCESS_NM, P_PRCS_CREDS, P_RDS_CREDS, P_ALARM_NM, P_WEBEX_ROOM_ID, P_WEBEX_ROOM_BOT_ARN, P_KEYS
+
+    P_PRCS_CREDS = dict()
+    P_RDS_CREDS = dict()
+
+    P_RDS_CREDS[process_config.KEY_SSL_MODE] = process_config.SSL_MODE_REQUIRE
+    P_RDS_CREDS[process_config.KEY_SSL_ROOT_CERT] = process_config.SSL_ROOT_CERT
+
+    args = dict()
+    rds_cert = process_config.SSL_ROOT_CERT
+    sc.logger.info(f"rds_cert ->{rds_cert}")
+
+    args = dict()
+    if envType == None:
+        args = getResolvedOptions(
+            sys.argv,
+            [
+                "JOB_NAME",
+                "env",
+                "rds_secret_arn",
+                "pcrs_secret_arn",
+                "kafka_secret_arn",
+                "run_type",
+                "source_table",
+                "target_table",
+                "proc_control_id",
+                "process_nm",
+                "cw_alarm_name",
+                "alarm_room_id",
+                "alarm_bot_creds",
+                "claim_keys",
+            ],
+        )
+        P_ENV = args["env"]
+        P_RDS_SECRET = args["rds_secret_arn"]
+        P_PCRS_SECRET = args["pcrs_secret_arn"]
+        P_KAFKA_SECRET = args["kafka_secret_arn"]
+        P_JOB_RUN_ID = args["JOB_RUN_ID"]
+        P_JOB_NM = args["JOB_NAME"]
+        P_RUN_TYPE = args["run_type"]
+        P_SOURCE_TBL = args["source_table"]
+        P_TARGET_TBL = args["target_table"]
+        P_CONTROL_ID = args["proc_control_id"]
+        P_PROCESS_NM = args["process_nm"]
+        P_ALARM_NM = args["cw_alarm_name"]
+        P_WEBEX_ROOM_ID = args["alarm_room_id"]
+        P_WEBEX_ROOM_BOT_ARN = args["alarm_bot_creds"]
+        P_KEYS = args["claim_keys"]
+
+    else:
+        P_ENV = "local"
+        P_RDS_SECRET = "arn:aws:secretsmanager:us-east-1:548482232092:secret:cs-dev-shared-cluster-ech_glue_usr-fXtVlU"
+        P_PCRS_SECRET = "arn:aws:secretsmanager:us-east-1:548482232092:secret:cs-ech-pcrs-credential-KGrs21"
+        P_KAFKA_SECRET = "arn:aws:secretsmanager:us-east-1:548482232092:secret:cs-ech-kafka-credential-gbzHpN"
+        P_JOB_RUN_ID = "test123456"
+        P_JOB_NM = "test"
+        P_RUN_TYPE = "H"
+        P_SOURCE_TBL = "uvw_HCC_FinalizedClaimDataPull_Payer_2022"
+        P_TARGET_TBL = "cs_ech.stg_pcrs_payer"
+        P_CONTROL_ID = 1
+        P_PROCESS_NM = process_config.C_PROCESS_NM
+        P_ALARM_NM = "cs-ech-dev-failed-task-warn"
+        P_WEBEX_ROOM_ID = "Y2lzY29zcGFyazovL3VzL1JPT00vNGFjMGZlYjAtMzE3OS0xMWVlLTk0NGMtYTc1MmM4YWNlYWQw"
+        P_WEBEX_ROOM_BOT_ARN = "arn:aws:secretsmanager:us-east-1:548482232092:secret:cs-ech-webex-credential-KhPiCN"
+        P_KEYS = args["claim_keys"]
+
+    sc.logger.info("****************************************")
+    sc.logger.info("Execution Started ...! ")
+    sc.logger.info("Environment   : {}".format(P_ENV))
+    sc.logger.info("Job Name      : {}".format(P_JOB_NM))
+    sc.logger.info("Run Type      : {}".format(P_RUN_TYPE))
+    sc.logger.info("****************************************")
+
+    if P_ENV != "local":
+        temp_dict = get_secrets(P_RDS_SECRET)
+        P_RDS_CREDS[process_config.KEY_HOST] = temp_dict["host"]
+        P_RDS_CREDS[process_config.KEY_DATABASE] = (
+            process_config.C_DATABASE + P_ENV.lower()
+        )
+        P_RDS_CREDS[process_config.KEY_USERNAME] = temp_dict["username"]
+        P_RDS_CREDS[process_config.KEY_PASSWORD] = temp_dict["password"]
+        P_RDS_CREDS[process_config.KEY_PORT] = temp_dict["port"]
+        # P_RDS_CREDS[process_config.KEY_ENGINE] = temp_dict["engine"]
+        P_RDS_CREDS[process_config.KEY_ENGINE] = "aurora-postgresql"
+
+    else:
+        P_RDS_CREDS[process_config.KEY_HOST] = "127.0.0.1"
+        P_RDS_CREDS[process_config.KEY_DATABASE] = "ech_dev"
+        P_RDS_CREDS[process_config.KEY_USERNAME] = "ech_l2support_usr"
+        P_RDS_CREDS[process_config.KEY_PASSWORD] = "ech_l2support_usr"
+        P_RDS_CREDS[process_config.KEY_PORT] = "5433"
+        P_RDS_CREDS[process_config.KEY_ENGINE] = "aurora-postgresql"
+
+    P_PRCS_CREDS = get_secrets(P_PCRS_SECRET)
+
+    pg_util_obj = Postgres(P_RDS_CREDS, None, None)
+    ms_util_obj = SqlServerUtils(None, True, P_PCRS_SECRET)
+
+    return pg_util_obj, ms_util_obj
+
+
+def construct_sqlalchemy_panda(db_config):
+    dbPandaEngine = None
+    sc.logger.info(f"the data type -> {db_config[KEY_ENGINE]}")
+    if db_config[KEY_ENGINE].lower() == "aurora-postgresql":
+        rdspassword = quote_plus(db_config["DB_PASSWORD"])
+        conn_string = "postgresql+psycopg2://{0}:{1}@{2}/{3}?{4}={5}&{6}={7}".format(
+            db_config["DB_USERNAME"],
+            rdspassword,
+            db_config["DB_HOST"],
+            db_config["DB_DATABASE"],
+            process_config.KEY_SSL_MODE,
+            db_config[process_config.KEY_SSL_MODE],
+            process_config.KEY_SSL_ROOT_CERT,
+            db_config[process_config.KEY_SSL_ROOT_CERT],
+        )
+
+        dbPandaEngine = create_engine(conn_string)
+    elif db_config[KEY_ENGINE].lower() == "sqlserver":
+        pcrspassword = quote_plus(db_config["DB_PASSWORD"])
+        conn_string = "mssql+pymssql://{0}:{1}@{2}:{3}/{4}".format(
+            db_config["DB_USERNAME"],
+            pcrspassword,
+            db_config["DB_HOST"],
+            db_config["DB_PORT"],
+            db_config["DB_DATABASE"],
+        )
+        dbPandaEngine = create_engine(conn_string)
+
+    return dbPandaEngine
+
+
+def populate_id_map_tables(sourceDBCreds, targetDbCreds, query):
+
+    srcEng = construct_sqlalchemy_panda(sourceDBCreds)
+    db_df = pd.read_sql(query, srcEng)
+    sc.logger.info(f"how many records -> {len(db_df)}")
+    if (len(db_df)) > 0:
+        trgtEng = construct_sqlalchemy_panda(targetDbCreds)
+        trgt = trgtEng.connect()
+        query = text(
+            f""" 
+                        INSERT INTO {ID_ORIGINAL_MAP_TABLE} (batch_id,src,id,originalclaimnumber)
+                        VALUES %s
+                        ON CONFLICT (src,id)
+                        DO  UPDATE SET originalclaimnumber= excluded.originalclaimnumber,
+                                        batch_id = excluded.batch_id,
+                                        update_dt= current_timestamp
+                """
+            % ",".join([str(i) for i in list(db_df.to_records(index=False))]).replace(
+                '"', "'"
+            )
+        )
+        trgt.execute(query)
+
+
+def read_cols_from_db(connection_obj):
+    """
+
+    :param df:
+    :param connection_obj:
+    :return:
+    """
+
+    df = (
+        sc.glueContext.read.format("jdbc")
+        .option("driver", connection_obj["driver"])
+        .option("url", connection_obj["url"])
+        .option("user", connection_obj["user"])
+        .option("password", connection_obj["password"])
+        .option("dbtable", "(select * from {} where 1=0) as qry".format(P_TARGET_TBL))
+        .load()
+    )
+
+    cols_names = df.columns
+    print(f"cols_name -> {cols_names}")
+    return cols_names
+
+
+def rename_dataframe_as_target_tbl(df, connection_obj):
+    """
+
+    :param df:
+    :param connection_obj:
+    :return:
+    """
+    target_cols = read_cols_from_db(connection_obj)
+    print(target_cols)
+    target_cols.remove("create_dt")
+    target_cols.remove("update_dt")
+
+    dfNew = df.toDF(*target_cols)
+
+    return dfNew
+
+
+def rename_as_target(df):
+    """
+
+    :param df:
+    :param connection_obj:
+    :return:
+    """
+
+    for old_name, new_name in process_config.renameCol.items():
+        df = df.withColumnRenamed(old_name, new_name)
+
+    return df
+
+
+def write_to_relation_db(df, connection_obj, create_dt):
+    """
+
+    :param df:
+    :param connection_obj:
+    :return:
+    """
+
+    df = df.withColumn(
+        "create_dt", to_timestamp(lit(create_dt), "yyyy-MM-dd HH:mm:ss.SSSSSS")
+    ).withColumn(
+        "update_dt", to_timestamp(lit(create_dt), "yyyy-MM-dd HH:mm:ss.SSSSSS")
+    )
+
+    df.repartition(20).write.mode("append").format("jdbc").option(
+        "batchsize", 20000
+    ).option("driver", connection_obj["driver"]).option(
+        "url", connection_obj["url"]
+    ).option(
+        "user", connection_obj["user"]
+    ).option(
+        "password", connection_obj["password"]
+    ).option(
+        "dbtable", P_TARGET_TBL
+    ).save()
+    count = df.count()
+    return count
+
+
+def read_from_relational_db(query, connection_obj):
+    """
+
+    :param query:
+    :param connection_obj:
+    :return:
+    """
+    sc.logger.info("Query is requested for exection : {}".format(query))
+    sc.logger.info(
+        "connection_obj is requested for exection : {}".format(connection_obj)
+    )
+    try:
+        start_time = time.time()
+        df = (
+            sc.glueContext.read.format("jdbc")
+            .option("driver", connection_obj["driver"])
+            .option("url", connection_obj["url"])
+            .option("user", connection_obj["user"])
+            .option("password", connection_obj["password"])
+            .option("dbtable", query)
+            .option("encrypt", "true")
+            .option("trustServerCertificate", "true")
+            .load()
+        )
+        end_time = time.time()
+        sc.logger.info(
+            "Time Take to Read from Relational DB: {}".format(
+                (end_time - start_time) / 60
+            )
+        )
+        df.printSchema()
+        return df
+    except (Py4JJavaError, Exception) as e:
+        err_msg = (
+            "Unrecoverable Error Occurred from read_from_relational_db : {}".format(e)
+        )
+        sc.logger.error(err_msg)
+        exit(1)
+
+
+def get_latest_revision(df, group_by_cols, select_cols, order_cols=None):
+    """
+    This method handles dedup logic on DF.
+
+    """
+
+    sc.logger.info("Preparing DataSet using : {}".format(group_by_cols))
+    if order_cols is None:
+        order_cols = group_by_cols
+    win = (
+        Window()
+        .partitionBy(group_by_cols)
+        .orderBy(*[desc(col_name) for col_name in order_cols])
+    )
+    df = df.withColumn("row", row_number().over(win)).where("row==1").drop("row")
+    df = df.select(select_cols)
+    return df
+
+
+def get_all_attributes_of_latest_revision(df1, df2):
+    """
+    This method does inner join on two dataframes & returns all columns of df1.
+
+    """
+    return df1.join(
+        df2, ["deDupKey", "id", "adddate", "maintdate"], how="inner"
+    ).select(df1["*"])
+
+
+def construct_json(df, df_cols, ignore_nulls):
+    """
+    This method construct a json out of columns passed as argument. the columns must be part of a dataframe.
+
+    """
+
+    df = df.withColumn(
+        "record",
+        F.to_json(
+            F.struct([df[cols] for cols in df_cols]),
+            options={"ignoreNullFields": ignore_nulls},
+        ),
+    )
+    return df.drop(*df.columns[1 : len(df.columns) - 1])
+
+
+def concat_code_cols(arg1, arg2, arg3):
+    """
+    This method construct code set values into a string with delimiter.
+
+    """
+
+    if arg1:
+        if not arg2:
+            arg2 = "None"
+        if not arg3:
+            arg3 = "None"
+        else:
+            if isinstance(arg3, datetime.date):
+                arg3 = arg3.strftime("%Y-%m-%dT%H:%M:%S.%f")
+        return arg1 + "~" + arg2 + "~" + arg3
+
+
+def transform_codes_common(code_cols, df, return_codeset_cols):
+    """
+    This method transforms code sets from rows into columns . Also, creates a JSON array out of all codesets.
+
+    :return:
+    """
+
+    each_col_set = F.udf(lambda a, b, c: concat_code_cols(a, b, c), StringType())
+    df = df.withColumn(
+        "concatCodes",
+        F.concat_ws(
+            ",",
+            *[each_col_set(F.col(a), F.col(b), F.col(c)) for (a, b, c) in code_cols],
+        ),
+    ).withColumn("codeSetSplits", F.split(F.col("concatCodes"), ","))
+    df = df.select("id", F.explode(df.codeSetSplits).alias("codesSets"))
+    split_codes = F.split(df.codesSets, "~")
+    return (
+        df.withColumn(return_codeset_cols[0], split_codes.getItem(0))
+        .withColumn(
+            return_codeset_cols[1],
+            when(split_codes.getItem(1) == "None", None).otherwise(
+                split_codes.getItem(1)
+            ),
+        )
+        .withColumn(
+            return_codeset_cols[2],
+            when(split_codes.getItem(2) == "None", None).otherwise(
+                split_codes.getItem(2)
+            ),
+        )
+        .drop("codesSets")
+    )
+
+
+def transform_cond_codes(code_cols, df):
+    """
+    This method transforms condition codes columns into a JSON array. also, removed individual columns upon
+    successful creation of an array.
+
+    :return:
+    """
+
+    return (
+        df.withColumn("condcdList", F.array([col(x) for x in code_cols]))
+        .withColumn("condcd", F.expr("FILTER(condcdList, x -> x is not null)"))
+        .drop(*code_cols, "condcdList")
+    )
+
+
+def bkp_transform_cond_codes(code_cols, df):
+    """
+    This method transforms condition codes columns into a JSON array. also, removed individual columns upon
+    successful creation of an array.
+
+    :return:
+    """
+
+    return (
+        df.withColumn(
+            "condcdList",
+            F.array(
+                "condcd1",
+                "condcd2",
+                "condcd3",
+                "condcd4",
+                "condcd5",
+                "condcd6",
+                "condcd7",
+                "condcd8",
+                "condcd9",
+                "condcd10",
+                "condcd11",
+                "condcd12",
+                "condcd13",
+                "condcd14",
+                "condcd15",
+                "condcd16",
+                "condcd17",
+                "condcd18",
+                "condcd19",
+                "condcd20",
+                "condcd21",
+                "condcd22",
+                "condcd23",
+                "condcd24",
+            ),
+        )
+        .withColumn("condcd", F.expr("FILTER(condcdList, x -> x is not null)"))
+        .drop(*code_cols, "condcdList")
+    )
+
+
+def prepare_final_message(df):
+    """
+
+    :param df:
+    :return:
+    """
+    if P_ENV == "local":
+        cw_log = boto3.client("logs")
+        try:
+            response = cw_log.create_log_stream(
+                logGroupName="/aws-kakfa/jobs/log", logStreamName=P_BATCHID
+            )
+        except Exception as e:
+            pass
+    sc.logger.info("prepare_final_message started")
+    combined_df_count = 0
+    totalCnt = 0
+    combined_df_count = df.count()
+    sumCount = df.rdd.mapPartitions(publish_message).collect()
+    print(sumCount)
+
+    for cnt in sumCount:
+        totalCnt += cnt
+    print(totalCnt)
+    return totalCnt, combined_df_count
+
+
+def publish_message(df_rows):
+    """
+    This method invoked for each df partition and process all claims. under each DF partition, the method
+    format and build final JSON message as to publish to Kafka Topic.
+
+    :param df_rows:
+    :return:
+    """
+
+    cw_log = boto3.client("logs")
+
+    final_dict = dict()
+    entity_audit_dict = dict()
+    record_count = 0
+    msgCount = []
+    kafka_utils_obj = KafkaProducer(P_ENV, kafka_config, kafka_cert, kafka_creds)
+    for clm_event in df_rows:
+        record_count += 1
+        clm_event = clm_event.asDict()
+        final_dict["entityModel"] = process_config.C_MODEL_NAME
+        final_dict["businessArea"] = process_config.C_BUS_ARE
+        final_dict["source"] = process_config.C_SOURCE
+        final_dict["messageVersion"] = process_config.C_VER
+        final_dict["messageId"] = audit_util_obj.get_message_id()
+        final_dict["messageTs"] = audit_util_obj.get_date_time_str()
+        final_dict["processName"] = P_PROCESS_NM
+        final_dict["processId"] = P_BATCHID
+        final_dict["claimId"] = clm_event["id"]
+        topic_partition_key = clm_event["id"]
+        entity_records = list()
+        for each_record in json.loads(clm_event["entityRecords"]):
+            records_dict = dict()
+            records_dict["recordType"] = each_record["recordType"]
+            entity_audit_dict[each_record["recordType"]] = len(each_record["records"])
+            if each_record["recordType"] in process_config.codeRecTypes:
+                records_dict["records"] = [
+                    json.loads(item)
+                    for item in each_record["records"]
+                    if json.loads(item)["val"]
+                ]
+            else:
+                records_dict["records"] = [
+                    json.loads(item) for item in each_record["records"]
+                ]
+            entity_records.append(records_dict)
+        final_dict["entityRecords"] = entity_records
+        claim_entity_msg = json.dumps(final_dict, default=str)
+        _status = kafka_utils_obj.publish_message(claim_entity_msg, topic_partition_key)
+        kafka_utils_obj.producer_conn.flush()
+        # log_to_cw(claim_entity_msg, cw_log)
+    msgCount.append(record_count)
+    return iter(msgCount)
+
+
+def log_to_cw(msg, cw_log):
+    """
+    Logs an entry to S3 bucket from the spark executor
+    """
+    try:
+        cw_log.put_log_events(
+            logGroupName="/aws-kakfa/jobs/log",
+            logStreamName=P_BATCHID,
+            logEvents=[{"timestamp": int(time.time() * 1000), "message": msg}],
+        )
+    except Exception as e:
+        pass
+
+
+def create_audit_entry(audit_util_obj: AuditUtils, minDt, maxDt):
+    """
+    Inserts an entry into audit table
+    """
+    proc_audit = dict()
+    sc.logger.info("Inserting into audit table")
+    proc_audit["run_id"] = P_BATCHID
+    proc_audit["process_nm"] = P_PROCESS_NM
+    proc_audit["proc_control_id"] = P_CONTROL_ID
+    proc_audit["srcCode"] = process_config.C_SOURCE
+    proc_audit["process_status"] = process_config.C_PROCESS_STATUS[2]
+    proc_audit["totalRows"] = None
+    proc_audit["successRows"] = None
+    proc_audit["failureRows"] = None
+    proc_audit["ignoredRows"] = None
+    proc_audit["loadStartTs"] = audit_util_obj.get_date_time_str()
+    proc_audit["loadEndTs"] = None
+    proc_audit["extrtStartTs"] = minDt
+    proc_audit["extrtEndTs"] = maxDt
+    proc_audit["updateUser"] = P_JOB_NM
+    proc_audit["updateTs"] = audit_util_obj.get_date_time_str()
+    proc_audit["lastUpdTs"] = audit_util_obj.get_date_time_str()
+    proc_audit["lastUpdUser"] = P_JOB_NM
+    proc_audit["jobRunID"] = P_JOB_RUN_ID
+    proc_audit["comment"] = P_SOURCE_TBL
+    sc.logger.info("Audit table entry created")
+    return proc_audit
+
+
+def construct_spark_jdbc_connection(db_config, db_type=None):
+    """
+
+    :return:
+    """
+    if db_type == process_config.C_SQLSERVER:
+        server_name = (
+            "jdbc:"
+            + db_config["DB_ENGINE"]
+            + "://"
+            + db_config["DB_HOST"]
+            + ":"
+            + str(db_config["DB_PORT"])
+        )
+        url = server_name + ";" + "databaseName=" + db_config["DB_DATABASE"] + ";"
+        return {
+            "url": url,
+            "driver": "com.microsoft.sqlserver.jdbc.SQLServerDriver",
+            "user": db_config["DB_USERNAME"],
+            "password": db_config["DB_PASSWORD"],
+        }
+    else:
+        database_uri = (
+            db_config["DB_HOST"]
+            + ":"
+            + str(db_config["DB_PORT"])
+            + "/"
+            + db_config["DB_DATABASE"]
+        )
+        return {
+            "url": "jdbc:postgresql://" + database_uri,
+            "driver": "org.postgresql.Driver",
+            "user": db_config["DB_USERNAME"],
+            "password": db_config["DB_PASSWORD"],
+        }
+
+
+def preprocess(pg_util_obj, ms_util_obj):
+    """
+    To derive the time range for the incremental run
+    """
+    start_process_query = process_config.getStatusOfPoller.format(P_PROCESS_NM)
+    resp = pg_util_obj.execute_reader(start_process_query, None, True, None)
+    minDt = datetime.datetime.strptime(
+        "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+    )
+    maxDt = datetime.datetime.strptime(
+        "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+    )
+    audit_rec_endts = datetime.datetime.strptime(
+        "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+    )
+    totalSrcCnt = 0
+
+    sc.logger.info("Completed the query for getting the min date range for current run")
+    if resp is None:
+        raise Exception(
+            f"There is no active control records for process ->{P_PROCESS_NM}"
+        )
+    else:
+        print(resp)
+        if resp[2] != None:
+            minDt = resp[2]
+            maxDt = resp[2]
+            audit_rec_endts = resp[7]
+        minDt = minDt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        sc.logger.info(
+            f"Gathering the min datetime for the process {P_PROCESS_NM} query : Min Date {minDt} & source table {P_SOURCE_TBL}"
+        )
+
+        dataMaxDateQuery = process_config.getMaxDateFromSource.format(P_SOURCE_TBL)
+        pcrsAuditEndTs = process_config.PROCESS_AUDT_TABLE_QUERY.format(
+            process_config.PYSL_AUDIT_CONFIG[P_PROCESS_NM]
+        )
+
+        sc.logger.info(
+            f"The query to get the max date in the source table: {dataMaxDateQuery}"
+        )
+        respSrc = ms_util_obj.execute_reader(dataMaxDateQuery, None, True, None)
+        auditSrc = ms_util_obj.execute_reader(pcrsAuditEndTs, None, True, None)
+
+        if respSrc is None:
+            raise Exception(f"No records found in the src")
+        else:
+            sc.logger.info(f"respSrc to the query is: {respSrc}")
+            srcMaxDt = respSrc.get("maxdate")
+            if srcMaxDt != None:
+                # maxDt=srcMaxDt
+                maxDt = srcMaxDt - datetime.timedelta(seconds=process_config.C_LAG_TIME)
+                totalSrcCnt = respSrc.get("row_count")
+
+        sc.logger.info(f"auditSrc to the query is: {auditSrc}")
+        if auditSrc != None and auditSrc.get("end_ts", None) != None:
+            audit_rec_endts = auditSrc.get("end_ts")
+        minDt = datetime.datetime.strptime(
+        "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+        )
+        maxDt = maxDt.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+    return minDt, maxDt, totalSrcCnt, audit_rec_endts
+
+
+def union_all(*dfs):
+    """
+    This method accepts multiple data frames as arguments and returns union of all Dfs.
+    """
+    return reduce(F.DataFrame.union, dfs)
+
+
+def coreProcess(pcrs_creds_dict, eps_creds_dict, minDt, maxDt, audit_util_obj, credt):
+    cnt = 0
+    totalCnt = 0
+    combined_df_count = 0
+
+    pcrs_connection_obj = construct_spark_jdbc_connection(
+        pcrs_creds_dict, process_config.C_SQLSERVER
+    )
+    eps_connection_obj = construct_spark_jdbc_connection(eps_creds_dict, None)
+    if P_RUN_TYPE == "D":
+        sc.logger.info(f"P_KEYS in run type are ->{P_KEYS}")
+        query = process_config.data_pull_query.format(
+            P_BATCHID, P_SOURCE_TBL, minDt, maxDt
+        )
+        if P_KEYS.upper() != "NONE" and len(P_KEYS) > 0:
+            sc.logger.info(f"replay keys are ->{P_KEYS}")
+            if (len(P_KEYS.split(","))) > 1:
+                key_args_list = tuple(P_KEYS.split(","))
+            else:
+                sc.logger.info(f"replay lenth {str(len(P_KEYS.split(',')))}")
+                key_args_list = f"('{P_KEYS}')"
+            sc.logger.info(f"replay key_args_list are ->{key_args_list}")
+            query = process_config.data_pull_query_with_args.format(
+                P_BATCHID, P_SOURCE_TBL, minDt, maxDt, key_args_list
+            )
+        id_query = process_config.id_data_pull_query.format(P_BATCHID, P_SOURCE_TBL)
+
+    else:
+        query = process_config.data_pull_query_hist.format(P_BATCHID, P_SOURCE_TBL)
+        id_query = process_config.id_data_pull_query_hist.format(
+            P_BATCHID, P_SOURCE_TBL
+        )
+
+    populate_id_map_tables(pcrs_creds_dict, eps_creds_dict, id_query)
+    sc.logger.info(f"query from the source based on run type->{query}")
+
+    # df_filter = int(audit_util_obj.get_date_time_with_format("%Y")) - 5
+    df_filter = (
+        int(audit_util_obj.get_date_time_with_format("%Y")) - 5
+        if int(audit_util_obj.get_date_time_with_format("%Y")) - 5 > 2019
+        else 2019
+    )
+    sc.logger.info(f"The filter year based on the current year->{df_filter}")
+
+    dfSourceRaw = read_from_relational_db(query, pcrs_connection_obj)
+    # write_to_relation_db(df_pcrs_claim, eps_connection_obj,credt)
+
+    for old_name, new_name in process_config.renamed_view_cols_dict.items():
+        dfSourceRaw = dfSourceRaw.withColumnRenamed(old_name, new_name)
+
+    # write_to_relation_db(df_pcrs_claim, eps_connection_obj,credt)
+    totalCnt = dfSourceRaw.count()
+
+    dfSourceRaw = dfSourceRaw.filter(
+        substring(col("enddt"), 1, 4).cast("int") >= lit(df_filter)
+    )
+
+    df_pcrs_claim = dfSourceRaw.withColumn(
+        "deDupKey",
+        F.when(dfSourceRaw.originalclaimnumber.isNull(), dfSourceRaw.id).otherwise(
+            dfSourceRaw.originalclaimnumber
+        ),
+    )
+
+    df_pcrs_claim = df_pcrs_claim.repartition("deDupKey")
+
+    # totalCnt = df_pcrs_claim.count()
+
+    # df_pcrs_claim.show()
+    # if(P_RUN_TYPE == "D"):
+    #     totalCnt = df_pcrs_claim.count()
+    #     sc.logger.info(f"source count->{totalCnt}")
+
+    """
+    dedupKeyColumns -select main columns: "deDupKey","id", "adddate", "maintdate"
+    """
+    df_pcrs_latest_claim = get_latest_revision(
+        df_pcrs_claim,
+        process_config.groupByDedupCols,
+        process_config.dedupKeyColumns,
+        process_config.orderByCols,
+    )
+
+    df_latest_claim = get_all_attributes_of_latest_revision(
+        df_pcrs_claim, df_pcrs_latest_claim
+    )
+
+    for colname in df_latest_claim.columns:
+        df_latest_claim = df_latest_claim.withColumn(colname, F.trim(F.col(colname)))
+
+    sc.logger.info("Preparing Claim Level DataSet")
+    df_claim = get_latest_revision(
+        df_latest_claim,
+        process_config.groupByClaim,
+        process_config.claimLevelCols,
+        process_config.orderByCols,
+    )
+
+    df_claim_header = df_claim.select(process_config.claimHeaderCols)
+    df_claim_header = construct_json(df_claim_header, df_claim_header.columns, False)
+    df_claim_header = df_claim_header.withColumn(
+        "recordType", F.lit(process_config.recordTypes[0])
+    )
+
+    sc.logger.info("Preparing Line DataSet for JSON Construct")
+    df_line = df_latest_claim.select(process_config.lineCols)
+    df_line = construct_json(df_line, df_line.columns, False)
+    df_line = df_line.withColumn("recordType", F.lit(process_config.recordTypes[1]))
+    # print("ClaimLines Count:", df_line.head(1), audit_utils.get_real_date_time_str())
+
+    sc.logger.info("Preparing Claim Diag Codes DataSet for JSON Construct")
+    df_diag_codes = df_claim.select(process_config.diagCodeCols)
+    df_diag_codes = transform_codes_common(
+        process_config.diagCodeSetCols, df_diag_codes, process_config.diagPublisherCols
+    )
+    df_diag_codes = construct_json(df_diag_codes, df_diag_codes.columns[1:], False)
+    df_diag_codes = df_diag_codes.withColumn(
+        "recordType", F.lit(process_config.recordTypes[2])
+    )
+    # print("ClaimDiags Count:", df_diag_codes.head(1), audit_utils.get_real_date_time_str())
+
+    sc.logger.info("Preparing Claim Proc Codes DataSet for JSON Construct")
+    df_proc_codes = df_claim.select(process_config.procCodeCols)
+    df_proc_codes = transform_codes_common(
+        process_config.procCodeSetCols, df_proc_codes, process_config.procPublisherCols
+    )
+    df_proc_codes = construct_json(df_proc_codes, df_proc_codes.columns[1:], False)
+    df_proc_codes = df_proc_codes.withColumn(
+        "recordType", F.lit(process_config.recordTypes[3])
+    )
+    # print("ClaimProcs Count:", df_proc_codes.head(1), audit_utils.get_real_date_time_str())
+
+    sc.logger.info("Preparing Claim Proc Codes DataSet for JSON Construct")
+    df_cond_codes = df_claim.select(process_config.condCodeCols)
+    df_cond_codes = transform_cond_codes(process_config.condCodeSetCols, df_cond_codes)
+    df_cond_codes = construct_json(df_cond_codes, df_cond_codes.columns[1:], True)
+    df_cond_codes = df_cond_codes.withColumn(
+        "recordType", F.lit(process_config.recordTypes[4])
+    )
+
+    sc.logger.info("Preparing Claim ECI Codes DataSet for JSON Construct")
+    df_eci_codes = df_claim.select(process_config.eciCodeCols)
+    df_eci_codes = transform_codes_common(
+        process_config.eciCodeSetCols, df_eci_codes, process_config.eciPublisherCols
+    )
+    df_eci_codes = construct_json(df_eci_codes, df_eci_codes.columns[1:], False)
+    df_eci_codes = df_eci_codes.withColumn(
+        "recordType", F.lit(process_config.recordTypes[5])
+    )
+
+    sc.logger.info("Preparing Combined DataSet of all dfs")
+    dfs = [
+        df_claim_header,
+        df_line,
+        df_diag_codes,
+        df_proc_codes,
+        df_cond_codes,
+        df_eci_codes,
+    ]
+    sc.logger.info("Preparing Combined DataSet of all dfs")
+    combined_df = union_all(*dfs)
+
+    sc.logger.info("Aggregating Dataframe by ClaimID & RecordType")
+    combined_df = combined_df.groupby(process_config.groupByClaimRecordType).agg(
+        F.collect_list("record").alias("records")
+    )
+    sc.logger.info("Aggregating & JSON message by ClaimID")
+    combined_df = combined_df.groupby(process_config.groupByClaim).agg(
+        F.to_json(F.collect_list(F.struct("recordType", "records"))).alias(
+            "entityRecords"
+        )
+    )
+    combined_df.persist(StorageLevel.MEMORY_AND_DISK)
+
+    cnt, combined_df_count = prepare_final_message(combined_df)
+
+    return totalCnt, cnt, combined_df_count
+
+
+def get_kafka_config():
+    """
+    Gets the kafka config and cert
+    """
+    sc.logger.info("Getting kafka config and cert")
+    global kafka_config, kafka_cert, P_ENV
+    sc.logger.info("Kafka config created")
+    kafka_config = "kafka_config.yaml"
+    if P_ENV.upper() != "PROD":
+        kafka_cert = "kafka.client.truststore_nonprod.pem"
+    else:
+        kafka_cert = "kafka.client.truststore_prod.pem"
+
+    sc.logger.info(f"kafka_cert ->{kafka_cert}")
+
+
+def main(envType):
+    try:
+        cnt = 0
+        totalCnt = 0
+        totalSrcCnt = 0
+        combined_df_count = 0
+        processStatus = "SUCCEEDED"
+        minDt = datetime.datetime.strptime(
+            "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+        )
+        maxDt = datetime.datetime.strptime(
+            "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+        )
+        audit_rec_endts = datetime.datetime.strptime(
+            "1900-01-01 00:00:00.000000", "%Y-%m-%d %H:%M:%S.%f"
+        )
+
+        sc.logger.info("Main Method Execution Started ...!")
+        pg_util_obj, ms_util_obj = setArgs(envType)
+        global P_BATCHID, P_PROCESS_REF_ID, kafka_creds, audit_util_obj
+        kafka_creds = get_secrets(P_KAFKA_SECRET)
+        get_kafka_config()
+        P_BATCHFMT = process_config.C_BATCH_FMT
+        audit_util_obj = AuditUtils()
+
+        P_BATCHID = audit_util_obj.get_run_id(P_BATCHFMT)
+        P_PROCESS_REF_ID = audit_util_obj.get_poll_id(
+            P_BATCHFMT, process_config.C_PUBLISHER_PROCESS
+        )
+
+        credt = audit_util_obj.get_date_time_with_format("%Y-%m-%d %H:%M:%S.%f")
+
+        insAuditQuery = process_config.insAuditQry
+        insArgs = create_audit_entry(audit_util_obj, minDt, maxDt)
+        insResp = pg_util_obj.execute_reader(insAuditQuery, insArgs, True, None)
+        pg_util_obj.commit()
+        process_audit_id = insResp[0]
+
+        minDt, maxDt, totalSrcCnt, audit_rec_endts = preprocess(
+            pg_util_obj, ms_util_obj
+        )
+        sc.logger.info(
+            f"Getthe min & max datetime for the query & PCRS Audit for the query in the source side:{minDt} , {maxDt},{audit_rec_endts} & source table {P_SOURCE_TBL}"
+        )
+
+        beginUpdControlSql = process_config.updInProcessInControl.format(
+            process_config.C_PROCESS_STATUS[2],
+            minDt,
+            maxDt,
+            audit_rec_endts,
+            credt,
+            P_PROCESS_NM,
+        )
+        pg_util_obj.execute_non_query(beginUpdControlSql, None)
+        pg_util_obj.commit()
+
+        sc.logger.info(f"Generate process_audit_id : {process_audit_id}")
+
+        if str(audit_util_obj.ts.hour) in ("01", "1", "02", "2"):
+            tempDT = audit_util_obj.ts.replace(
+                hour=0, minute=0, second=0, microsecond=0
+            ) + datetime.timedelta(days=-1)
+            sc.logger.info(f"tempDT : {tempDT}")
+            strTempDT = tempDT.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            minDt = minDt if (minDt) < strTempDT else strTempDT
+            sc.logger.info(f"Mid night min Date is : {minDt}")
+
+        totalCnt, cnt, combined_df_count = coreProcess(
+            P_PRCS_CREDS, P_RDS_CREDS, minDt, maxDt, audit_util_obj, credt
+        )
+
+    except Exception as e:
+        sc.logger.error("Detailed Error message  -> " + str(e))
+        processStatus = "FAILED"
+    finally:
+        tz = timezone("US/Eastern")
+        updt = datetime.datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S.%f")
+        if processStatus == "FAILED":
+
+            updControlSql = process_config.updFailProcessedInControl.format(
+                processStatus, updt, P_PROCESS_NM
+            )
+            sc.logger.info(f"end audit sql (failed)  -> {updControlSql}")
+            updControlRes = pg_util_obj.execute_non_query(updControlSql, None)
+            pg_util_obj.commit()
+
+            updAuditSql = process_config.updAuditProcess.format(
+                processStatus,
+                P_JOB_RUN_ID,
+                minDt,
+                maxDt,
+                updt,
+                updt,
+                totalCnt,
+                cnt,
+                combined_df_count,
+                "PCRS Audit time:" + str(audit_rec_endts) + ": " + P_SOURCE_TBL,
+                process_audit_id,
+            )
+            sc.logger.info(f"updAuditSql  -> {updAuditSql}")
+
+            updAuditRes = pg_util_obj.execute_non_query(updAuditSql, None)
+            pg_util_obj.commit()
+
+            raise Exception(
+                f"Job Failed due to some reason- please check job log for details"
+            )
+
+        else:
+            updControlSqlRaw = process_config.updSuccProcessedInControl
+
+            updControlSql = updControlSqlRaw.format(
+                processStatus, minDt, maxDt, updt, audit_rec_endts, P_PROCESS_NM
+            )
+            sc.logger.info(f"end audit sql (SUCCEEDED)  -> {updControlSql}")
+            updControlRes = pg_util_obj.execute_non_query(updControlSql, None)
+            pg_util_obj.commit()
+
+            updAuditSql = process_config.updAuditProcess.format(
+                processStatus,
+                P_JOB_RUN_ID,
+                minDt,
+                maxDt,
+                updt,
+                updt,
+                totalCnt,
+                cnt,
+                combined_df_count,
+                "PCRS Audit time:" + str(audit_rec_endts) + ": " + P_SOURCE_TBL,
+                process_audit_id,
+            )
+            sc.logger.info(f"updAuditSql  -> {updAuditSql}")
+
+            updAuditRes = pg_util_obj.execute_non_query(updAuditSql, None)
+            pg_util_obj.commit()
+
+
+# Press the green button in the gutter to run the script.
+if __name__ == "__main__":
+    global P_ENV, P_RDS_SECRET, P_PCRS_SECRET, P_KAFKA_SECRET, P_JOB_RUN_ID, P_JOB_NM, P_RUN_TYPE, P_SOURCE_TBL, P_TARGET_TBL, P_CONTROL_ID, P_PROCESS_NM, P_BATCHID, P_PROCESS_REF_ID, P_PRCS_CREDS, P_RDS_CREDS, P_ALARM_NM, P_WEBEX_ROOM_ID, P_WEBEX_ROOM_BOT_ARN, P_KEYS, kafka_config, kafka_cert, kafka_creds, audit_util_obj
+
+    envType = None
+    main(envType)

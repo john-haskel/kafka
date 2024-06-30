@@ -1,0 +1,19 @@
+bootstrap.servers : 'SASL_SSL://ip-10-190-71-6.ais-kafka-dev.aws.evernorthcloud.com:9095,SASL_SSL://ip-10-190-71-43.ais-kafka-dev.aws.evernorthcloud.com::9095,SASL_SSL://ip-10-190-71-92.ais-kafka-dev.aws.evernorthcloud.com:9095,SASL_SSL://ip-10-190-71-103.ais-kafka-dev.aws.evernorthcloud.com:9095,SASL_SSL://ip-10-190-71-15.ais-kafka-dev.aws.evernorthcloud.com:9095,SASL_SSL://ip-10-190-71-36.ais-kafka-dev.aws.evernorthcloud.com:9095,SASL_SSL://ip-10-190-71-86.ais-kafka-dev.aws.evernorthcloud.com:9095'
+group.id : 'cs-iap-ce-accum-history-consumer'
+queue.buffering.max.messages: 100000
+queue.buffering.max.ms: 100000
+batch.num.messages: 100
+default.topic.config:
+fetch.max.bytes: 52428800
+max.partition.fetch.bytes: 10485760
+auto.offset.reset: 'latest'
+enable.auto.commit: 'False'
+enable.auto.offset.store: 'True'
+enable.partition.eof: 'True'
+on_commit: 'on_commit'
+client.id: 'cs-iap-ce-accum-history-publisher'
+retries: 5
+polling: 10
+kafkaTopic : 'cs-ech-pcrs-art-delta-dev'
+sleepTime: 600
+eventTimeLag: 5
